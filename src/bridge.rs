@@ -12,10 +12,20 @@ pub struct BridgeHandle {
     pub tx: mpsc::UnboundedSender<String>,
 }
 
+/// Commands sent from the bridge receive loop to the playback loop.
+pub enum PlaybackCommand {
+    /// Complete TTS response (mu-law bytes) ready for playback.
+    PlayTts(Vec<u8>),
+    /// Start looping hold music.
+    HoldStart,
+    /// Stop hold music.
+    HoldStop,
+}
+
 /// Connect to voice-echo's /discord-stream WebSocket and spawn bridge tasks.
 ///
 /// Returns a BridgeHandle for sending outgoing messages (audio frames, control)
-/// and an mpsc receiver for complete TTS mu-law buffers (buffered until mark).
+/// and an mpsc receiver for playback commands (TTS buffers + hold music control).
 ///
 /// When either the send or receive loop exits (WebSocket closes, error, etc.),
 /// `on_disconnect` is notified so the caller can schedule a reconnect.
@@ -25,7 +35,8 @@ pub async fn connect(
     channel_id: &str,
     user_id: &str,
     on_disconnect: Arc<Notify>,
-) -> Result<(BridgeHandle, mpsc::Receiver<Vec<u8>>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(BridgeHandle, mpsc::Receiver<PlaybackCommand>), Box<dyn std::error::Error + Send + Sync>>
+{
     tracing::info!(url = ws_url, "Connecting to voice-echo");
 
     let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
@@ -48,8 +59,8 @@ pub async fn connect(
     // Channel for outgoing messages (AudioReceiver → WS, and mark-back → WS)
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
 
-    // Channel for complete TTS buffers (WS → playback task)
-    let (tts_tx, tts_rx) = mpsc::channel::<Vec<u8>>(4);
+    // Channel for playback commands (WS → playback task)
+    let (cmd_tx, cmd_rx) = mpsc::channel::<PlaybackCommand>(8);
 
     // Send loop: reads from outgoing channel, writes to WS
     let send_handle = tokio::spawn(async move {
@@ -62,7 +73,7 @@ pub async fn connect(
         tracing::info!("Bridge send loop exited");
     });
 
-    // Receive loop: reads from WS, buffers audio, sends complete TTS responses
+    // Receive loop: reads from WS, buffers audio, sends playback commands
     let recv_handle = tokio::spawn(async move {
         let mut audio_buffer: Vec<u8> = Vec::new();
 
@@ -107,11 +118,29 @@ pub async fn connect(
                             mulaw_bytes = audio_buffer.len(),
                             "TTS response buffered, sending to playback"
                         );
-                        if tts_tx.send(audio_buffer.clone()).await.is_err() {
+                        if cmd_tx
+                            .send(PlaybackCommand::PlayTts(audio_buffer.clone()))
+                            .await
+                            .is_err()
+                        {
                             tracing::error!("Playback channel closed");
                             break;
                         }
                         audio_buffer.clear();
+                    }
+                }
+                Some("hold_start") => {
+                    tracing::debug!("Received hold_start from voice-echo");
+                    if cmd_tx.send(PlaybackCommand::HoldStart).await.is_err() {
+                        tracing::error!("Playback channel closed");
+                        break;
+                    }
+                }
+                Some("hold_stop") => {
+                    tracing::debug!("Received hold_stop from voice-echo");
+                    if cmd_tx.send(PlaybackCommand::HoldStop).await.is_err() {
+                        tracing::error!("Playback channel closed");
+                        break;
                     }
                 }
                 other => {
@@ -132,7 +161,7 @@ pub async fn connect(
         on_disconnect.notify_one();
     });
 
-    Ok((BridgeHandle { tx: outgoing_tx }, tts_rx))
+    Ok((BridgeHandle { tx: outgoing_tx }, cmd_rx))
 }
 
 /// Encode a mu-law audio chunk as a JSON message for voice-echo.
@@ -165,4 +194,58 @@ pub fn decode_tts_for_playback(mulaw: &[u8]) -> Vec<u8> {
     let pcm_8k = codec::decode_mulaw(mulaw);
     let pcm_48k = codec::resample_linear(&pcm_8k, 8000, 48000);
     codec::mono_i16_to_stereo_f32_bytes(&pcm_48k)
+}
+
+/// Load a WAV file and convert to f32 stereo 48kHz bytes for songbird playback.
+///
+/// Handles any sample rate and channel count by resampling and up/downmixing.
+pub fn load_hold_music(path: &str, volume: f32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+
+    tracing::info!(
+        path = path,
+        channels = spec.channels,
+        sample_rate = spec.sample_rate,
+        bits = spec.bits_per_sample,
+        "Loading hold music"
+    );
+
+    // Read all samples as i16
+    let samples: Vec<i16> = match spec.sample_format {
+        hound::SampleFormat::Int => reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?,
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect(),
+    };
+
+    // Downmix to mono if stereo
+    let mono: Vec<i16> = if spec.channels == 2 {
+        codec::downmix_stereo(&samples)
+    } else {
+        samples
+    };
+
+    // Apply volume
+    let scaled: Vec<i16> = mono
+        .iter()
+        .map(|&s| (s as f32 * volume).clamp(-32768.0, 32767.0) as i16)
+        .collect();
+
+    // Resample to 48kHz
+    let pcm_48k = codec::resample_linear(&scaled, spec.sample_rate, 48000);
+
+    // Convert to f32 stereo bytes for songbird
+    let bytes = codec::mono_i16_to_stereo_f32_bytes(&pcm_48k);
+
+    tracing::info!(
+        pcm_bytes = bytes.len(),
+        duration_secs = pcm_48k.len() as f32 / 48000.0,
+        "Hold music loaded"
+    );
+
+    Ok(bytes)
 }

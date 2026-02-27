@@ -17,6 +17,15 @@ pub struct DiscordConfig {
 pub struct BridgeConfig {
     /// WebSocket URL for voice-echo's discord-stream endpoint.
     pub voice_echo_ws: String,
+    /// Path to hold music WAV file (played while Echo processes a response).
+    pub hold_music_file: Option<String>,
+    /// Hold music volume (0.0–1.0). Default: 0.3
+    #[serde(default = "default_hold_music_volume")]
+    pub hold_music_volume: f32,
+}
+
+fn default_hold_music_volume() -> f32 {
+    0.3
 }
 
 impl Config {

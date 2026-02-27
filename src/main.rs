@@ -8,11 +8,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use songbird::driver::{Channels as SbChannels, DecodeConfig, DecodeMode};
 use songbird::events::{CoreEvent, Event as SbEvent, EventContext, EventHandler as SbEventHandler};
 use songbird::input::RawAdapter;
 use songbird::shards::TwilightMap;
-use songbird::Songbird;
-use tokio::sync::{mpsc, Notify};
+use songbird::{Config as SbConfig, Songbird};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
@@ -77,6 +78,18 @@ async fn run() {
         "Starting discord-voice-echo"
     );
 
+    // Load hold music if configured
+    let hold_music: Option<Arc<Vec<u8>>> =
+        config.bridge.hold_music_file.as_ref().and_then(|path| {
+            match bridge::load_hold_music(path, config.bridge.hold_music_volume) {
+                Ok(bytes) => Some(Arc::new(bytes)),
+                Err(e) => {
+                    tracing::warn!("Failed to load hold music: {e}");
+                    None
+                }
+            }
+        });
+
     // Create twilight gateway shard
     let intents = Intents::GUILDS | Intents::GUILD_VOICE_STATES;
     let mut shard = Shard::new(ShardId::ONE, config.discord.bot_token.clone(), intents);
@@ -89,7 +102,19 @@ async fn run() {
 
     // Track non-bot users in our voice channel
     let mut channel_users: HashSet<Id<UserMarker>> = HashSet::new();
-    let mut bot_in_channel = false;
+
+    // Voice connection state: Idle → Joining → Connected
+    #[derive(Debug, PartialEq)]
+    enum VoiceState {
+        Idle,
+        Joining,
+        Connected,
+    }
+    let mut voice_state = VoiceState::Idle;
+
+    // Channel for join results from spawned tasks
+    let (join_tx, mut join_rx) =
+        mpsc::unbounded_channel::<Result<Arc<Mutex<songbird::Call>>, songbird::error::JoinError>>();
 
     // SSRC → Discord user ID mapping (populated by SpeakingStateUpdate events)
     let ssrc_map: Arc<RwLock<HashMap<u32, u64>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -100,7 +125,7 @@ async fn run() {
     // Bridge state
     let mut bridge_handle: Option<bridge::BridgeHandle> = None;
     let mut bridge_disconnect = Arc::new(Notify::new());
-    let mut call_lock: Option<Arc<tokio::sync::Mutex<songbird::Call>>> = None;
+    let mut call_lock: Option<Arc<Mutex<songbird::Call>>> = None;
     let mut playback_task: Option<JoinHandle<()>> = None;
     let playing = Arc::new(AtomicBool::new(false));
 
@@ -153,9 +178,16 @@ async fn run() {
                         let senders = TwilightMap::new(
                             [(shard_number, shard_sender.clone())].into_iter().collect(),
                         );
-                        songbird =
-                            Some(Arc::new(Songbird::twilight(Arc::new(senders), uid)));
-                        tracing::info!("Songbird voice driver initialized");
+                        let decode_cfg = DecodeConfig::new(
+                            SbChannels::Mono,
+                            songbird::driver::SampleRate::Hz48000,
+                        );
+                        let sb_config = SbConfig::default()
+                            .decode_mode(DecodeMode::Decode(decode_cfg));
+                        let sb = Songbird::twilight(Arc::new(senders), uid);
+                        sb.set_config(sb_config);
+                        songbird = Some(Arc::new(sb));
+                        tracing::info!("Songbird voice driver initialized (decode_mode=Decode)");
                     }
 
                     Event::VoiceStateUpdate(vs) => {
@@ -188,63 +220,28 @@ async fn run() {
                             );
                         }
 
-                        // Join if users present and we're not in
-                        if !channel_users.is_empty() && !bot_in_channel {
+                        // Join if users present and we're idle
+                        if !channel_users.is_empty() && voice_state == VoiceState::Idle {
                             if let Some(ref sb) = songbird {
                                 tracing::info!("Users detected, joining voice channel");
-                                match sb.join(guild_id, voice_channel_id).await {
-                                    Ok(cl) => {
-                                        tracing::info!("Joined voice channel");
-                                        bot_in_channel = true;
+                                voice_state = VoiceState::Joining;
 
-                                        // Register event handlers for this Call
-                                        {
-                                            let mut call = cl.lock().await;
-                                            call.add_global_event(
-                                                SbEvent::Core(CoreEvent::VoiceTick),
-                                                AudioReceiver {
-                                                    shared_tx: Arc::clone(&shared_tx),
-                                                    playing: Arc::clone(&playing),
-                                                    ssrc_map: Arc::clone(&ssrc_map),
-                                                },
-                                            );
-                                            call.add_global_event(
-                                                SbEvent::Core(CoreEvent::SpeakingStateUpdate),
-                                                SsrcMapper {
-                                                    ssrc_map: Arc::clone(&ssrc_map),
-                                                },
-                                            );
-                                        }
-                                        tracing::info!("Audio receiver and SSRC mapper registered");
-
-                                        call_lock = Some(cl.clone());
-
-                                        // Connect bridge to voice-echo
-                                        connect_bridge(
-                                            &config,
-                                            &cl,
-                                            &bot_user_id,
-                                            &shared_tx,
-                                            &playing,
-                                            &mut bridge_handle,
-                                            &mut bridge_disconnect,
-                                            &mut playback_task,
-                                            &mut reconnect_backoff,
-                                            &mut reconnect_at,
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to join voice channel: {e:?}"
-                                        );
-                                    }
-                                }
+                                // Spawn join in a separate task so the event loop
+                                // continues processing events (sb.process() must run
+                                // to forward VoiceStateUpdate/VoiceServerUpdate to songbird)
+                                let sb_clone = Arc::clone(sb);
+                                let tx = join_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = sb_clone.join(guild_id, voice_channel_id).await;
+                                    let _ = tx.send(result);
+                                });
                             }
                         }
 
-                        // Leave if no users and we're in
-                        if channel_users.is_empty() && bot_in_channel {
+                        // Leave if no users and we're connected
+                        if channel_users.is_empty()
+                            && voice_state == VoiceState::Connected
+                        {
                             if let Some(ref sb) = songbird {
                                 tracing::info!("Channel empty, leaving voice channel");
 
@@ -261,7 +258,7 @@ async fn run() {
                                         "Failed to leave voice channel: {e:?}"
                                     );
                                 }
-                                bot_in_channel = false;
+                                voice_state = VoiceState::Idle;
                                 bridge_handle = None;
                                 call_lock = None;
                                 shared_tx.clear();
@@ -289,9 +286,76 @@ async fn run() {
                 }
             }
 
+            // Join result from spawned task
+            Some(result) = join_rx.recv() => {
+                match result {
+                    Ok(cl) => {
+                        tracing::info!("Joined voice channel");
+                        voice_state = VoiceState::Connected;
+
+                        // Register event handlers for this Call
+                        {
+                            let mut call = cl.lock().await;
+                            call.add_global_event(
+                                SbEvent::Core(CoreEvent::VoiceTick),
+                                AudioReceiver {
+                                    shared_tx: Arc::clone(&shared_tx),
+                                    playing: Arc::clone(&playing),
+                                    ssrc_map: Arc::clone(&ssrc_map),
+                                    silence_ticks: RwLock::new(HashMap::new()),
+                                },
+                            );
+                            call.add_global_event(
+                                SbEvent::Core(CoreEvent::SpeakingStateUpdate),
+                                SsrcMapper {
+                                    ssrc_map: Arc::clone(&ssrc_map),
+                                },
+                            );
+                        }
+                        tracing::info!("Audio receiver and SSRC mapper registered");
+
+                        call_lock = Some(cl.clone());
+
+                        // Connect bridge to voice-echo
+                        connect_bridge(
+                            &config,
+                            &cl,
+                            &bot_user_id,
+                            &shared_tx,
+                            &playing,
+                            &hold_music,
+                            &mut bridge_handle,
+                            &mut bridge_disconnect,
+                            &mut playback_task,
+                            &mut reconnect_backoff,
+                            &mut reconnect_at,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to join voice channel: {e:?}");
+                        voice_state = VoiceState::Idle;
+
+                        // Retry if users are still present
+                        if !channel_users.is_empty() {
+                            if let Some(ref sb) = songbird {
+                                tracing::info!("Retrying voice channel join...");
+                                voice_state = VoiceState::Joining;
+                                let sb_clone = Arc::clone(sb);
+                                let tx = join_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = sb_clone.join(guild_id, voice_channel_id).await;
+                                    let _ = tx.send(result);
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             // Bridge disconnected — schedule reconnect
             _ = bridge_disconnect.notified() => {
-                if bridge_handle.is_some() && bot_in_channel {
+                if bridge_handle.is_some() && voice_state == VoiceState::Connected {
                     tracing::warn!("Bridge disconnected, scheduling reconnect");
                     bridge_handle = None;
                     shared_tx.clear();
@@ -318,7 +382,7 @@ async fn run() {
             } => {
                 reconnect_at = None;
 
-                if !bot_in_channel {
+                if voice_state != VoiceState::Connected {
                     continue;
                 }
 
@@ -330,6 +394,7 @@ async fn run() {
                         &bot_user_id,
                         &shared_tx,
                         &playing,
+                        &hold_music,
                         &mut bridge_handle,
                         &mut bridge_disconnect,
                         &mut playback_task,
@@ -363,7 +428,7 @@ async fn run() {
     }
 
     // Leave voice channel
-    if bot_in_channel {
+    if voice_state != VoiceState::Idle {
         if let Some(ref sb) = songbird {
             if let Err(e) = sb.leave(guild_id).await {
                 tracing::error!("Failed to leave voice channel during shutdown: {e:?}");
@@ -388,10 +453,11 @@ async fn run() {
 #[allow(clippy::too_many_arguments)]
 async fn connect_bridge(
     config: &Config,
-    call_lock: &Arc<tokio::sync::Mutex<songbird::Call>>,
+    call_lock: &Arc<Mutex<songbird::Call>>,
     bot_user_id: &Option<Id<UserMarker>>,
     shared_tx: &Arc<SharedBridgeTx>,
     playing: &Arc<AtomicBool>,
+    hold_music: &Option<Arc<Vec<u8>>>,
     bridge_handle: &mut Option<bridge::BridgeHandle>,
     bridge_disconnect: &mut Arc<Notify>,
     playback_task: &mut Option<JoinHandle<()>>,
@@ -412,17 +478,18 @@ async fn connect_bridge(
     )
     .await
     {
-        Ok((handle, tts_rx)) => {
+        Ok((handle, cmd_rx)) => {
             // Set the shared sender so AudioReceiver can use it
             shared_tx.set(handle.tx.clone());
             tracing::info!("Audio receiver connected to bridge");
 
-            // Spawn TTS playback task
+            // Spawn playback task
             let play_call = call_lock.clone();
             let play_tx = handle.tx.clone();
             let play_flag = Arc::clone(playing);
+            let play_music = hold_music.clone();
             *playback_task = Some(tokio::spawn(playback_loop(
-                tts_rx, play_call, play_tx, play_flag,
+                cmd_rx, play_call, play_tx, play_flag, play_music,
             )));
 
             *bridge_handle = Some(handle);
@@ -481,11 +548,25 @@ impl SharedBridgeTx {
 ///
 /// Uses SharedBridgeTx so the sender can be swapped on reconnect
 /// without re-registering this handler with songbird.
+///
+/// When a user stops speaking, Discord stops sending audio packets.
+/// But voice-echo's VAD needs silence frames to detect end-of-utterance.
+/// So we track recently-speaking SSRCs and send silence frames for them
+/// until the VAD has had enough silence to trigger (up to 2 seconds).
 struct AudioReceiver {
     shared_tx: Arc<SharedBridgeTx>,
     playing: Arc<AtomicBool>,
     ssrc_map: Arc<RwLock<HashMap<u32, u64>>>,
+    /// SSRCs that were recently speaking → ticks since last speech.
+    /// Used to send silence frames after speech stops.
+    silence_ticks: RwLock<HashMap<u32, u32>>,
 }
+
+/// 2 seconds of silence at 50 ticks/sec (20ms per tick).
+const SILENCE_TICK_LIMIT: u32 = 100;
+
+/// Mu-law silence (160 bytes = 20ms at 8kHz). 0xFF is mu-law encoding of PCM zero.
+const MULAW_SILENCE_FRAME: [u8; 160] = [0xFF; 160];
 
 #[async_trait]
 impl SbEventHandler for AudioReceiver {
@@ -496,18 +577,52 @@ impl SbEventHandler for AudioReceiver {
                 return None;
             }
 
+            // Process speaking SSRCs: send real audio
             for (&ssrc, data) in &tick.speaking {
                 if let Some(decoded) = &data.decoded_voice {
-                    // Look up Discord user ID from SSRC
                     let user_id = self.ssrc_map.read().unwrap().get(&ssrc).copied();
 
-                    // decoded is mono i16 PCM at 48kHz (~960 samples per 20ms tick)
+                    tracing::trace!(
+                        ssrc = ssrc,
+                        samples = decoded.len(),
+                        user_id = ?user_id,
+                        "Sending audio to bridge"
+                    );
+
                     let msg = bridge::encode_user_audio(decoded, ssrc, user_id);
                     if !self.shared_tx.send(msg) {
-                        // Bridge not connected or channel closed — silently drop
                         return None;
                     }
+
+                    // Mark as actively speaking (reset silence counter)
+                    self.silence_ticks.write().unwrap().insert(ssrc, 0);
                 }
+            }
+
+            // Process silent SSRCs: send silence frames so voice-echo's VAD
+            // can detect end-of-utterance. Only for SSRCs that were recently speaking.
+            let mut ticks = self.silence_ticks.write().unwrap();
+            let mut to_remove = Vec::new();
+
+            for (&ssrc, count) in ticks.iter_mut() {
+                // Skip if currently speaking (already handled above)
+                if tick.speaking.contains_key(&ssrc) {
+                    continue;
+                }
+
+                *count += 1;
+                if *count > SILENCE_TICK_LIMIT {
+                    to_remove.push(ssrc);
+                    continue;
+                }
+
+                let user_id = self.ssrc_map.read().unwrap().get(&ssrc).copied();
+                let msg = bridge::audio_message(&MULAW_SILENCE_FRAME, ssrc, user_id);
+                self.shared_tx.send(msg);
+            }
+
+            for ssrc in to_remove {
+                ticks.remove(&ssrc);
             }
         }
         None
@@ -537,58 +652,91 @@ impl SbEventHandler for SsrcMapper {
     }
 }
 
-/// TTS playback loop: receives complete mu-law buffers from bridge,
-/// converts to f32 stereo 48kHz, plays in songbird, waits for completion,
-/// then sends mark back to voice-echo.
+/// Playback loop: handles TTS responses and hold music.
+///
+/// Receives PlaybackCommands from the bridge:
+/// - HoldStart: loop hold music via songbird until HoldStop
+/// - HoldStop: stop the current hold music track
+/// - PlayTts: play TTS response, wait for completion, send mark back
 async fn playback_loop(
-    mut tts_rx: mpsc::Receiver<Vec<u8>>,
-    call_lock: Arc<tokio::sync::Mutex<songbird::Call>>,
+    mut cmd_rx: mpsc::Receiver<bridge::PlaybackCommand>,
+    call_lock: Arc<Mutex<songbird::Call>>,
     ws_tx: mpsc::UnboundedSender<String>,
     playing: Arc<AtomicBool>,
+    hold_music: Option<Arc<Vec<u8>>>,
 ) {
-    while let Some(mulaw_buffer) = tts_rx.recv().await {
-        tracing::info!(
-            mulaw_bytes = mulaw_buffer.len(),
-            "Playing TTS response in Discord"
-        );
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            bridge::PlaybackCommand::HoldStart => {
+                if let Some(ref music_bytes) = hold_music {
+                    tracing::info!("Starting hold music");
+                    playing.store(true, Ordering::Relaxed);
 
-        // Suppress audio sending during playback
-        playing.store(true, Ordering::Relaxed);
+                    let cursor = std::io::Cursor::new(music_bytes.as_ref().clone());
+                    let adapter = RawAdapter::new(cursor, 48000, 2);
+                    let input: songbird::input::Input = adapter.into();
 
-        // Convert: mu-law 8kHz mono → f32 48kHz stereo bytes
-        let f32_bytes = bridge::decode_tts_for_playback(&mulaw_buffer);
+                    let mut call = call_lock.lock().await;
+                    call.stop();
+                    let handle = call.play_input(input);
+                    // Loop the hold music
+                    if let Err(e) = handle.enable_loop() {
+                        tracing::warn!("Failed to enable hold music loop: {e:?}");
+                    }
+                }
+            }
 
-        // Create songbird input from raw f32 PCM
-        let cursor = std::io::Cursor::new(f32_bytes);
-        let adapter = RawAdapter::new(cursor, 48000, 2);
-        let input: songbird::input::Input = adapter.into();
+            bridge::PlaybackCommand::HoldStop => {
+                tracing::debug!("Stopping hold music");
+                let mut call = call_lock.lock().await;
+                call.stop();
+                // Don't reset playing — TTS response is about to play
+            }
 
-        // Play — stop any previous track first
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        {
-            let mut call = call_lock.lock().await;
-            call.stop();
-            let handle = call.play_input(input);
+            bridge::PlaybackCommand::PlayTts(mulaw_buffer) => {
+                tracing::info!(
+                    mulaw_bytes = mulaw_buffer.len(),
+                    "Playing TTS response in Discord"
+                );
 
-            // Register handler to notify when playback finishes
-            if let Err(e) = handle.add_event(
-                SbEvent::Track(songbird::events::TrackEvent::End),
-                PlaybackDone {
-                    tx: std::sync::Mutex::new(Some(done_tx)),
-                },
-            ) {
-                tracing::warn!("Failed to register playback end handler: {e:?}");
+                // Suppress audio sending during playback
+                playing.store(true, Ordering::Relaxed);
+
+                // Convert: mu-law 8kHz mono → f32 48kHz stereo bytes
+                let f32_bytes = bridge::decode_tts_for_playback(&mulaw_buffer);
+
+                // Create songbird input from raw f32 PCM
+                let cursor = std::io::Cursor::new(f32_bytes);
+                let adapter = RawAdapter::new(cursor, 48000, 2);
+                let input: songbird::input::Input = adapter.into();
+
+                // Play — stop any previous track first
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                {
+                    let mut call = call_lock.lock().await;
+                    call.stop();
+                    let handle = call.play_input(input);
+
+                    if let Err(e) = handle.add_event(
+                        SbEvent::Track(songbird::events::TrackEvent::End),
+                        PlaybackDone {
+                            tx: std::sync::Mutex::new(Some(done_tx)),
+                        },
+                    ) {
+                        tracing::warn!("Failed to register playback end handler: {e:?}");
+                    }
+                }
+
+                // Wait for playback to finish
+                let _ = done_rx.await;
+
+                tracing::debug!("TTS playback finished");
+                playing.store(false, Ordering::Relaxed);
+
+                // Send mark back to voice-echo so it resets VAD
+                ws_tx.send(r#"{"type":"mark"}"#.to_string()).ok();
             }
         }
-
-        // Wait for playback to finish (or channel close)
-        let _ = done_rx.await;
-
-        tracing::debug!("TTS playback finished");
-        playing.store(false, Ordering::Relaxed);
-
-        // Send mark back to voice-echo so it resets VAD
-        ws_tx.send(r#"{"type":"mark"}"#.to_string()).ok();
     }
 
     tracing::info!("Playback loop exited");
