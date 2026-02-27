@@ -1,6 +1,8 @@
 # discord-voice-echo
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/github/license/dnacenta/discord-voice-echo)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/dnacenta/discord-voice-echo?label=version&color=green)](https://github.com/dnacenta/discord-voice-echo/tags)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange)](https://rustup.rs/)
 
 Discord voice channel sidecar for [voice-echo](https://github.com/dnacenta/voice-echo). Lets users talk to Echo directly in a Discord voice channel using the same pipeline (VAD → STT → Claude → TTS) that powers phone calls.
 
