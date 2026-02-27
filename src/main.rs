@@ -690,7 +690,9 @@ async fn playback_loop(
                 tracing::debug!("Stopping hold music");
                 let mut call = call_lock.lock().await;
                 call.stop();
-                // Don't reset playing — TTS response is about to play
+                // Reset playing — if PlayTts follows it will re-set it.
+                // Without this, a timeout or error leaves capture suppressed.
+                playing.store(false, Ordering::Relaxed);
             }
 
             bridge::PlaybackCommand::PlayTts(mulaw_buffer) => {
