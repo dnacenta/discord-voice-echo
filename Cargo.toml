@@ -1,5 +1,5 @@
 [package]
-name = "discord-voice"
+name = "discord-voice-echo"
 version = "0.1.0"
 edition = "2021"
 description = "Discord voice sidecar for voice-echo"

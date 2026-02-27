@@ -27,7 +27,7 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("--version") => println!("discord-voice {VERSION}"),
+        Some("--version") => println!("discord-voice-echo {VERSION}"),
         Some("--help") | Some("-h") => print_usage(),
         Some(other) => {
             eprintln!("Unknown option: {other}");
@@ -42,10 +42,10 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("discord-voice {VERSION}");
+    println!("discord-voice-echo {VERSION}");
     println!("Discord voice sidecar for voice-echo");
     println!();
-    println!("Usage: discord-voice [OPTIONS]");
+    println!("Usage: discord-voice-echo [OPTIONS]");
     println!();
     println!("Options:");
     println!("  --version   Print version");
@@ -56,7 +56,7 @@ async fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "discord_voice=info".into()),
+                .unwrap_or_else(|_| "discord_voice_echo=info".into()),
         )
         .init();
 
@@ -74,7 +74,7 @@ async fn run() {
     tracing::info!(
         guild_id = config.discord.guild_id,
         voice_channel_id = config.discord.voice_channel_id,
-        "Starting discord-voice"
+        "Starting discord-voice-echo"
     );
 
     // Create twilight gateway shard

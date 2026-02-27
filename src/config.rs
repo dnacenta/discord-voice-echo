@@ -22,7 +22,7 @@ pub struct BridgeConfig {
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-        let config_dir = std::path::PathBuf::from(home).join(".discord-voice");
+        let config_dir = std::path::PathBuf::from(home).join(".discord-voice-echo");
 
         // Load .env if present
         let env_path = config_dir.join(".env");
