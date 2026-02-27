@@ -1,0 +1,23 @@
+[package]
+name = "discord-voice"
+version = "0.1.0"
+edition = "2021"
+description = "Discord voice sidecar for voice-echo"
+license = "MIT"
+
+[dependencies]
+songbird = { git = "https://github.com/dnacenta/songbird", branch = "dave", default-features = false, features = ["driver", "gateway", "twilight", "rustls", "receive", "tws"] }
+twilight-gateway = "0.16"
+twilight-model = "0.16"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+dotenvy = "0.15"
+async-trait = "0.1"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+base64 = "0.22"
+rubato = "1.0"
