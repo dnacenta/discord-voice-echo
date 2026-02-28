@@ -1,1 +1,4 @@
 /target
+
+# AI tooling (local only)
+.claude/
