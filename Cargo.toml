@@ -3,7 +3,7 @@ name = "discord-voice-echo"
 version = "0.1.0"
 edition = "2021"
 description = "Discord voice sidecar for voice-echo"
-license = "MIT"
+license = "AGPL-3.0"
 
 [dependencies]
 songbird = { git = "https://github.com/dnacenta/songbird", branch = "dave", default-features = false, features = ["driver", "gateway", "twilight", "rustls", "receive", "tws"] }
