@@ -1,6 +1,6 @@
 # discord-voice-echo
 
-[![License: MIT](https://img.shields.io/github/license/dnacenta/discord-voice-echo)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/github/license/dnacenta/discord-voice-echo)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dnacenta/discord-voice-echo?label=version&color=green)](https://github.com/dnacenta/discord-voice-echo/tags)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange)](https://rustup.rs/)
 
@@ -137,4 +137,4 @@ voice-echo → discord-voice-echo:
 
 ## License
 
-MIT
+AGPL-3.0
