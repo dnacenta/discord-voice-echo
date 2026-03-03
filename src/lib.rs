@@ -1,0 +1,737 @@
+//! discord-voice-echo — Discord voice sidecar for voice-echo.
+//!
+//! Connects to a Discord voice channel, captures user audio, relays it
+//! to voice-echo via WebSocket, and plays back TTS responses. Handles
+//! auto-join/leave, silence frame injection for VAD, hold music, and
+//! exponential backoff reconnection.
+//!
+//! # Usage as a library
+//!
+//! ```no_run
+//! use discord_voice_echo::{DiscordEcho, config::Config};
+//!
+//! # fn run() {
+//! let config = Config::load().expect("config");
+//! let mut discord = DiscordEcho::new(config);
+//! // discord.start().await.expect("server");
+//! # }
+//! ```
+
+pub mod bridge;
+pub mod codec;
+pub mod config;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use echo_system_types::{HealthStatus, SetupPrompt};
+use songbird::driver::{Channels as SbChannels, DecodeConfig, DecodeMode};
+use songbird::events::{CoreEvent, Event as SbEvent, EventContext, EventHandler as SbEventHandler};
+use songbird::input::RawAdapter;
+use songbird::shards::TwilightMap;
+use songbird::{Config as SbConfig, Songbird};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
+use twilight_model::id::marker::{ChannelMarker, GuildMarker, UserMarker};
+use twilight_model::id::Id;
+
+use config::Config;
+
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// The discord-voice-echo plugin. Manages the Discord voice sidecar lifecycle.
+pub struct DiscordEcho {
+    config: Config,
+    running: bool,
+    shutdown: Arc<Notify>,
+}
+
+impl DiscordEcho {
+    /// Create a new DiscordEcho instance from config.
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            running: false,
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Start the Discord voice sidecar. Connects to the gateway and
+    /// manages voice channel presence. Blocks until shutdown.
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.running = true;
+        let config = &self.config;
+
+        let guild_id: Id<GuildMarker> = Id::new(config.discord.guild_id);
+        let voice_channel_id: Id<ChannelMarker> = Id::new(config.discord.voice_channel_id);
+
+        // Load hold music if configured
+        let hold_music: Option<Arc<Vec<u8>>> =
+            config.bridge.hold_music_file.as_ref().and_then(|path| {
+                match bridge::load_hold_music(path, config.bridge.hold_music_volume) {
+                    Ok(bytes) => Some(Arc::new(bytes)),
+                    Err(e) => {
+                        tracing::warn!("Failed to load hold music: {e}");
+                        None
+                    }
+                }
+            });
+
+        // Create twilight gateway shard
+        let intents = Intents::GUILDS | Intents::GUILD_VOICE_STATES;
+        let mut shard = Shard::new(ShardId::ONE, config.discord.bot_token.clone(), intents);
+        let shard_number = shard.id().number();
+        let shard_sender = shard.sender();
+
+        // Songbird + bot identity — initialized on Ready event
+        let mut songbird: Option<Arc<Songbird>> = None;
+        let mut bot_user_id: Option<Id<UserMarker>> = None;
+
+        // Track non-bot users in our voice channel
+        let mut channel_users: HashSet<Id<UserMarker>> = HashSet::new();
+
+        // Voice connection state
+        #[derive(Debug, PartialEq)]
+        enum VoiceState {
+            Idle,
+            Joining,
+            Connected,
+        }
+        let mut voice_state = VoiceState::Idle;
+
+        // Channel for join results from spawned tasks
+        let (join_tx, mut join_rx) = mpsc::unbounded_channel::<
+            Result<Arc<Mutex<songbird::Call>>, songbird::error::JoinError>,
+        >();
+
+        // SSRC → Discord user ID mapping
+        let ssrc_map: Arc<RwLock<HashMap<u32, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        // Shared bridge sender — swappable on reconnect
+        let shared_tx: Arc<SharedBridgeTx> = Arc::new(SharedBridgeTx::new());
+
+        // Bridge state
+        let mut bridge_handle: Option<bridge::BridgeHandle> = None;
+        let mut bridge_disconnect = Arc::new(Notify::new());
+        let mut call_lock: Option<Arc<Mutex<songbird::Call>>> = None;
+        let mut playback_task: Option<JoinHandle<()>> = None;
+        let playing = Arc::new(AtomicBool::new(false));
+
+        // Reconnect state
+        let mut reconnect_at: Option<Instant> = None;
+        let mut reconnect_backoff = Duration::from_secs(1);
+
+        // Shutdown signal
+        let shutdown = Arc::clone(&self.shutdown);
+
+        tracing::info!("Connecting to Discord gateway...");
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Shutdown signal (highest priority)
+                _ = shutdown.notified() => {
+                    tracing::info!("Shutdown signal received");
+                    break;
+                }
+
+                // Gateway events
+                item = shard.next_event(EventTypeFlags::all()) => {
+                    let event = match item {
+                        Some(Ok(e)) => e,
+                        Some(Err(e)) => {
+                            tracing::warn!("Gateway error: {e:?}");
+                            continue;
+                        }
+                        None => {
+                            tracing::info!("Gateway connection closed");
+                            break;
+                        }
+                    };
+
+                    // Forward all events to songbird
+                    if let Some(ref sb) = songbird {
+                        sb.process(&event).await;
+                    }
+
+                    match &event {
+                        Event::Ready(ready) => {
+                            let uid = ready.user.id;
+                            tracing::info!(
+                                user_id = uid.get(),
+                                name = %ready.user.name,
+                                "Connected to Discord"
+                            );
+                            bot_user_id = Some(uid);
+
+                            let senders = TwilightMap::new(
+                                [(shard_number, shard_sender.clone())].into_iter().collect(),
+                            );
+                            let decode_cfg = DecodeConfig::new(
+                                SbChannels::Mono,
+                                songbird::driver::SampleRate::Hz48000,
+                            );
+                            let sb_config = SbConfig::default()
+                                .decode_mode(DecodeMode::Decode(decode_cfg));
+                            let sb = Songbird::twilight(Arc::new(senders), uid);
+                            sb.set_config(sb_config);
+                            songbird = Some(Arc::new(sb));
+                            tracing::info!("Songbird voice driver initialized");
+                        }
+
+                        Event::VoiceStateUpdate(vs) => {
+                            let user_id = vs.user_id;
+
+                            if bot_user_id == Some(user_id) {
+                                continue;
+                            }
+
+                            if vs.guild_id != Some(guild_id) {
+                                continue;
+                            }
+
+                            let in_our_channel = vs.channel_id == Some(voice_channel_id);
+
+                            if in_our_channel {
+                                if channel_users.insert(user_id) {
+                                    tracing::info!(
+                                        user_id = user_id.get(),
+                                        "User joined voice channel"
+                                    );
+                                }
+                            } else if channel_users.remove(&user_id) {
+                                tracing::info!(
+                                    user_id = user_id.get(),
+                                    "User left voice channel"
+                                );
+                            }
+
+                            // Join if users present and idle
+                            if !channel_users.is_empty() && voice_state == VoiceState::Idle {
+                                if let Some(ref sb) = songbird {
+                                    tracing::info!("Users detected, joining voice channel");
+                                    voice_state = VoiceState::Joining;
+
+                                    let sb_clone = Arc::clone(sb);
+                                    let tx = join_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result =
+                                            sb_clone.join(guild_id, voice_channel_id).await;
+                                        let _ = tx.send(result);
+                                    });
+                                }
+                            }
+
+                            // Leave if empty and connected
+                            if channel_users.is_empty()
+                                && voice_state == VoiceState::Connected
+                            {
+                                if let Some(ref sb) = songbird {
+                                    tracing::info!("Channel empty, leaving voice channel");
+
+                                    if let Some(ref handle) = bridge_handle {
+                                        handle
+                                            .tx
+                                            .send(r#"{"type":"leave"}"#.to_string())
+                                            .ok();
+                                    }
+
+                                    if let Err(e) = sb.leave(guild_id).await {
+                                        tracing::error!(
+                                            "Failed to leave voice channel: {e:?}"
+                                        );
+                                    }
+                                    voice_state = VoiceState::Idle;
+                                    bridge_handle = None;
+                                    call_lock = None;
+                                    shared_tx.clear();
+                                    playing.store(false, Ordering::Relaxed);
+                                    reconnect_at = None;
+                                    reconnect_backoff = Duration::from_secs(1);
+                                    ssrc_map.write().unwrap().clear();
+
+                                    if let Some(task) = playback_task.take() {
+                                        task.abort();
+                                    }
+                                }
+                            }
+                        }
+
+                        Event::GatewayReconnect => {
+                            tracing::info!("Gateway reconnecting");
+                        }
+
+                        Event::Resumed => {
+                            tracing::info!("Gateway resumed");
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                // Join result
+                Some(result) = join_rx.recv() => {
+                    match result {
+                        Ok(cl) => {
+                            tracing::info!("Joined voice channel");
+                            voice_state = VoiceState::Connected;
+
+                            {
+                                let mut call = cl.lock().await;
+                                call.add_global_event(
+                                    SbEvent::Core(CoreEvent::VoiceTick),
+                                    AudioReceiver {
+                                        shared_tx: Arc::clone(&shared_tx),
+                                        playing: Arc::clone(&playing),
+                                        ssrc_map: Arc::clone(&ssrc_map),
+                                        silence_ticks: RwLock::new(HashMap::new()),
+                                    },
+                                );
+                                call.add_global_event(
+                                    SbEvent::Core(CoreEvent::SpeakingStateUpdate),
+                                    SsrcMapper {
+                                        ssrc_map: Arc::clone(&ssrc_map),
+                                    },
+                                );
+                            }
+                            tracing::info!("Audio receiver and SSRC mapper registered");
+
+                            call_lock = Some(cl.clone());
+
+                            connect_bridge(
+                                config,
+                                &cl,
+                                &bot_user_id,
+                                &shared_tx,
+                                &playing,
+                                &hold_music,
+                                &mut bridge_handle,
+                                &mut bridge_disconnect,
+                                &mut playback_task,
+                                &mut reconnect_backoff,
+                                &mut reconnect_at,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to join voice channel: {e:?}");
+                            voice_state = VoiceState::Idle;
+
+                            if !channel_users.is_empty() {
+                                if let Some(ref sb) = songbird {
+                                    tracing::info!("Retrying voice channel join...");
+                                    voice_state = VoiceState::Joining;
+                                    let sb_clone = Arc::clone(sb);
+                                    let tx = join_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result =
+                                            sb_clone.join(guild_id, voice_channel_id).await;
+                                        let _ = tx.send(result);
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Bridge disconnected
+                _ = bridge_disconnect.notified() => {
+                    if bridge_handle.is_some() && voice_state == VoiceState::Connected {
+                        tracing::warn!("Bridge disconnected, scheduling reconnect");
+                        bridge_handle = None;
+                        shared_tx.clear();
+                        playing.store(false, Ordering::Relaxed);
+
+                        if let Some(task) = playback_task.take() {
+                            task.abort();
+                        }
+
+                        reconnect_at = Some(Instant::now() + reconnect_backoff);
+                        tracing::info!(
+                            backoff_secs = reconnect_backoff.as_secs(),
+                            "Will attempt bridge reconnect"
+                        );
+                    }
+                }
+
+                // Reconnect timer
+                _ = async {
+                    match reconnect_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    reconnect_at = None;
+
+                    if voice_state != VoiceState::Connected {
+                        continue;
+                    }
+
+                    if let Some(ref cl) = call_lock {
+                        tracing::info!("Attempting bridge reconnect...");
+                        connect_bridge(
+                            config,
+                            cl,
+                            &bot_user_id,
+                            &shared_tx,
+                            &playing,
+                            &hold_music,
+                            &mut bridge_handle,
+                            &mut bridge_disconnect,
+                            &mut playback_task,
+                            &mut reconnect_backoff,
+                            &mut reconnect_at,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        // Graceful shutdown
+        tracing::info!("Shutting down gracefully...");
+
+        if let Some(ref handle) = bridge_handle {
+            handle.tx.send(r#"{"type":"leave"}"#.to_string()).ok();
+        }
+
+        if voice_state != VoiceState::Idle {
+            if let Some(ref sb) = songbird {
+                if let Err(e) = sb.leave(guild_id).await {
+                    tracing::error!("Failed to leave voice channel during shutdown: {e:?}");
+                } else {
+                    tracing::info!("Left voice channel");
+                }
+            }
+        }
+
+        if let Some(task) = playback_task.take() {
+            task.abort();
+        }
+
+        self.running = false;
+        tracing::info!("Shutdown complete");
+        Ok(())
+    }
+
+    /// Stop the Discord voice sidecar gracefully.
+    pub async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.shutdown.notify_one();
+        Ok(())
+    }
+
+    /// Report health status.
+    pub fn health(&self) -> HealthStatus {
+        if self.running {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Down("not started".into())
+        }
+    }
+
+    /// Configuration prompts for the echo-system init wizard.
+    pub fn setup_prompts() -> Vec<SetupPrompt> {
+        vec![
+            SetupPrompt {
+                key: "bot_token".into(),
+                question: "Discord Bot Token:".into(),
+                required: true,
+                secret: true,
+                default: None,
+            },
+            SetupPrompt {
+                key: "guild_id".into(),
+                question: "Discord Guild (Server) ID:".into(),
+                required: true,
+                secret: false,
+                default: None,
+            },
+            SetupPrompt {
+                key: "voice_channel_id".into(),
+                question: "Discord Voice Channel ID:".into(),
+                required: true,
+                secret: false,
+                default: None,
+            },
+            SetupPrompt {
+                key: "voice_echo_ws".into(),
+                question: "voice-echo WebSocket URL:".into(),
+                required: true,
+                secret: false,
+                default: Some("ws://127.0.0.1:8443/discord-stream".into()),
+            },
+        ]
+    }
+}
+
+/// Connect bridge to voice-echo and set up audio pipeline.
+#[allow(clippy::too_many_arguments)]
+async fn connect_bridge(
+    config: &Config,
+    call_lock: &Arc<Mutex<songbird::Call>>,
+    bot_user_id: &Option<Id<UserMarker>>,
+    shared_tx: &Arc<SharedBridgeTx>,
+    playing: &Arc<AtomicBool>,
+    hold_music: &Option<Arc<Vec<u8>>>,
+    bridge_handle: &mut Option<bridge::BridgeHandle>,
+    bridge_disconnect: &mut Arc<Notify>,
+    playback_task: &mut Option<JoinHandle<()>>,
+    reconnect_backoff: &mut Duration,
+    reconnect_at: &mut Option<Instant>,
+) {
+    let uid_str = bot_user_id.map(|u| u.get().to_string()).unwrap_or_default();
+
+    let new_disconnect = Arc::new(Notify::new());
+
+    match bridge::connect(
+        &config.bridge.voice_echo_ws,
+        &config.discord.guild_id.to_string(),
+        &config.discord.voice_channel_id.to_string(),
+        &uid_str,
+        Arc::clone(&new_disconnect),
+    )
+    .await
+    {
+        Ok((handle, cmd_rx)) => {
+            shared_tx.set(handle.tx.clone());
+            tracing::info!("Audio receiver connected to bridge");
+
+            let play_call = call_lock.clone();
+            let play_tx = handle.tx.clone();
+            let play_flag = Arc::clone(playing);
+            let play_music = hold_music.clone();
+            *playback_task = Some(tokio::spawn(playback_loop(
+                cmd_rx, play_call, play_tx, play_flag, play_music,
+            )));
+
+            *bridge_handle = Some(handle);
+            *bridge_disconnect = new_disconnect;
+            *reconnect_backoff = Duration::from_secs(1);
+            *reconnect_at = None;
+
+            tracing::info!("Bridge connected successfully");
+        }
+        Err(e) => {
+            tracing::error!("Failed to connect bridge: {e}");
+            *reconnect_backoff = (*reconnect_backoff * 2).min(MAX_RECONNECT_BACKOFF);
+            *reconnect_at = Some(Instant::now() + *reconnect_backoff);
+            tracing::info!(
+                backoff_secs = reconnect_backoff.as_secs(),
+                "Will retry bridge connection"
+            );
+        }
+    }
+}
+
+/// Shared bridge sender — swappable on reconnect without re-registering handlers.
+struct SharedBridgeTx {
+    inner: RwLock<Option<mpsc::UnboundedSender<String>>>,
+}
+
+impl SharedBridgeTx {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(None),
+        }
+    }
+
+    fn set(&self, tx: mpsc::UnboundedSender<String>) {
+        *self.inner.write().unwrap() = Some(tx);
+    }
+
+    fn clear(&self) {
+        *self.inner.write().unwrap() = None;
+    }
+
+    fn send(&self, msg: String) -> bool {
+        if let Some(ref tx) = *self.inner.read().unwrap() {
+            tx.send(msg).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+/// Audio receiver: captures decoded voice from Discord users.
+struct AudioReceiver {
+    shared_tx: Arc<SharedBridgeTx>,
+    playing: Arc<AtomicBool>,
+    ssrc_map: Arc<RwLock<HashMap<u32, u64>>>,
+    silence_ticks: RwLock<HashMap<u32, u32>>,
+}
+
+const SILENCE_TICK_LIMIT: u32 = 100;
+const MULAW_SILENCE_FRAME: [u8; 160] = [0xFF; 160];
+
+#[async_trait]
+impl SbEventHandler for AudioReceiver {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<SbEvent> {
+        if let EventContext::VoiceTick(tick) = ctx {
+            if self.playing.load(Ordering::Relaxed) {
+                return None;
+            }
+
+            for (&ssrc, data) in &tick.speaking {
+                if let Some(decoded) = &data.decoded_voice {
+                    let user_id = self.ssrc_map.read().unwrap().get(&ssrc).copied();
+
+                    tracing::trace!(
+                        ssrc = ssrc,
+                        samples = decoded.len(),
+                        user_id = ?user_id,
+                        "Sending audio to bridge"
+                    );
+
+                    let msg = bridge::encode_user_audio(decoded, ssrc, user_id);
+                    if !self.shared_tx.send(msg) {
+                        return None;
+                    }
+
+                    self.silence_ticks.write().unwrap().insert(ssrc, 0);
+                }
+            }
+
+            let mut ticks = self.silence_ticks.write().unwrap();
+            let mut to_remove = Vec::new();
+
+            for (&ssrc, count) in ticks.iter_mut() {
+                if tick.speaking.contains_key(&ssrc) {
+                    continue;
+                }
+
+                *count += 1;
+                if *count > SILENCE_TICK_LIMIT {
+                    to_remove.push(ssrc);
+                    continue;
+                }
+
+                let user_id = self.ssrc_map.read().unwrap().get(&ssrc).copied();
+                let msg = bridge::audio_message(&MULAW_SILENCE_FRAME, ssrc, user_id);
+                self.shared_tx.send(msg);
+            }
+
+            for ssrc in to_remove {
+                ticks.remove(&ssrc);
+            }
+        }
+        None
+    }
+}
+
+/// Maps SSRC → Discord user ID from songbird SpeakingStateUpdate events.
+struct SsrcMapper {
+    ssrc_map: Arc<RwLock<HashMap<u32, u64>>>,
+}
+
+#[async_trait]
+impl SbEventHandler for SsrcMapper {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<SbEvent> {
+        if let EventContext::SpeakingStateUpdate(update) = ctx {
+            if let Some(uid) = update.user_id {
+                let user_id = uid.0;
+                self.ssrc_map.write().unwrap().insert(update.ssrc, user_id);
+                tracing::debug!(ssrc = update.ssrc, user_id = user_id, "SSRC mapped to user");
+            }
+        }
+        None
+    }
+}
+
+/// Playback loop: handles TTS responses and hold music.
+async fn playback_loop(
+    mut cmd_rx: mpsc::Receiver<bridge::PlaybackCommand>,
+    call_lock: Arc<Mutex<songbird::Call>>,
+    ws_tx: mpsc::UnboundedSender<String>,
+    playing: Arc<AtomicBool>,
+    hold_music: Option<Arc<Vec<u8>>>,
+) {
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            bridge::PlaybackCommand::HoldStart => {
+                if let Some(ref music_bytes) = hold_music {
+                    tracing::info!("Starting hold music");
+                    playing.store(true, Ordering::Relaxed);
+
+                    let cursor = std::io::Cursor::new(music_bytes.as_ref().clone());
+                    let adapter = RawAdapter::new(cursor, 48000, 2);
+                    let input: songbird::input::Input = adapter.into();
+
+                    let mut call = call_lock.lock().await;
+                    call.stop();
+                    let handle = call.play_input(input);
+                    if let Err(e) = handle.enable_loop() {
+                        tracing::warn!("Failed to enable hold music loop: {e:?}");
+                    }
+                }
+            }
+
+            bridge::PlaybackCommand::HoldStop => {
+                tracing::debug!("Stopping hold music");
+                let mut call = call_lock.lock().await;
+                call.stop();
+                playing.store(false, Ordering::Relaxed);
+            }
+
+            bridge::PlaybackCommand::PlayTts(mulaw_buffer) => {
+                tracing::info!(
+                    mulaw_bytes = mulaw_buffer.len(),
+                    "Playing TTS response in Discord"
+                );
+
+                playing.store(true, Ordering::Relaxed);
+
+                let f32_bytes = bridge::decode_tts_for_playback(&mulaw_buffer);
+
+                let cursor = std::io::Cursor::new(f32_bytes);
+                let adapter = RawAdapter::new(cursor, 48000, 2);
+                let input: songbird::input::Input = adapter.into();
+
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                {
+                    let mut call = call_lock.lock().await;
+                    call.stop();
+                    let handle = call.play_input(input);
+
+                    if let Err(e) = handle.add_event(
+                        SbEvent::Track(songbird::events::TrackEvent::End),
+                        PlaybackDone {
+                            tx: std::sync::Mutex::new(Some(done_tx)),
+                        },
+                    ) {
+                        tracing::warn!("Failed to register playback end handler: {e:?}");
+                    }
+                }
+
+                let _ = done_rx.await;
+
+                tracing::debug!("TTS playback finished");
+                playing.store(false, Ordering::Relaxed);
+
+                ws_tx.send(r#"{"type":"mark"}"#.to_string()).ok();
+            }
+        }
+    }
+
+    tracing::info!("Playback loop exited");
+}
+
+/// Songbird event handler that fires when a track finishes playing.
+struct PlaybackDone {
+    tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[async_trait]
+impl SbEventHandler for PlaybackDone {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<SbEvent> {
+        if let Some(tx) = self.tx.lock().unwrap().take() {
+            tx.send(()).ok();
+        }
+        None
+    }
+}
