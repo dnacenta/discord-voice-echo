@@ -6,7 +6,7 @@ description = "Discord voice sidecar for voice-echo"
 license = "AGPL-3.0"
 
 [dependencies]
-echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.1.0" }
+echo-system-types = { git = "https://github.com/dnacenta/echo-system-types", tag = "v0.2.0" }
 songbird = { git = "https://github.com/dnacenta/songbird", branch = "dave", default-features = false, features = ["driver", "gateway", "twilight", "rustls", "receive", "tws"] }
 twilight-gateway = "0.16"
 twilight-model = "0.16"
