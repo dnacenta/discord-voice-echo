@@ -21,13 +21,17 @@ pub mod bridge;
 pub mod codec;
 pub mod config;
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use echo_system_types::{HealthStatus, SetupPrompt};
+use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
+use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
 use songbird::driver::{Channels as SbChannels, DecodeConfig, DecodeMode};
 use songbird::events::{CoreEvent, Event as SbEvent, EventContext, EventHandler as SbEventHandler};
 use songbird::input::RawAdapter;
@@ -427,7 +431,7 @@ impl DiscordEcho {
     }
 
     /// Report health status.
-    pub fn health(&self) -> HealthStatus {
+    fn health_check(&self) -> HealthStatus {
         if self.running {
             HealthStatus::Healthy
         } else {
@@ -436,7 +440,7 @@ impl DiscordEcho {
     }
 
     /// Configuration prompts for the echo-system init wizard.
-    pub fn setup_prompts() -> Vec<SetupPrompt> {
+    fn get_setup_prompts() -> Vec<SetupPrompt> {
         vec![
             SetupPrompt {
                 key: "bot_token".into(),
@@ -467,6 +471,49 @@ impl DiscordEcho {
                 default: Some("ws://127.0.0.1:8443/discord-stream".into()),
             },
         ]
+    }
+}
+
+/// Factory function — creates a fully initialized discord-voice-echo plugin.
+pub async fn create(
+    config: &serde_json::Value,
+    _ctx: &PluginContext,
+) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    let cfg: Config = serde_json::from_value(config.clone())?;
+    Ok(Box::new(DiscordEcho::new(cfg)))
+}
+
+impl Plugin for DiscordEcho {
+    fn meta(&self) -> PluginMeta {
+        PluginMeta {
+            name: "discord-voice-echo".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            description: "Discord voice sidecar".into(),
+        }
+    }
+
+    fn role(&self) -> PluginRole {
+        PluginRole::Interface
+    }
+
+    fn start(&mut self) -> PluginResult<'_> {
+        Box::pin(async move { self.start().await })
+    }
+
+    fn stop(&mut self) -> PluginResult<'_> {
+        Box::pin(async move { self.stop().await })
+    }
+
+    fn health(&self) -> Pin<Box<dyn Future<Output = HealthStatus> + Send + '_>> {
+        Box::pin(async move { self.health_check() })
+    }
+
+    fn setup_prompts(&self) -> Vec<SetupPrompt> {
+        Self::get_setup_prompts()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
