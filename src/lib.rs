@@ -30,8 +30,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use echo_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
-use echo_system_types::{HealthStatus, PluginMeta, SetupPrompt};
+use pulse_system_types::plugin::{Plugin, PluginContext, PluginResult, PluginRole};
+use pulse_system_types::{HealthStatus, PluginMeta, SetupPrompt};
 use songbird::driver::{Channels as SbChannels, DecodeConfig, DecodeMode};
 use songbird::events::{CoreEvent, Event as SbEvent, EventContext, EventHandler as SbEventHandler};
 use songbird::input::RawAdapter;

@@ -633,9 +633,9 @@ dependencies = [
  "async-trait",
  "base64",
  "dotenvy",
- "echo-system-types",
  "futures-util",
  "hound",
+ "pulse-system-types",
  "rubato 1.0.1",
  "serde",
  "serde_json",
@@ -689,15 +689,6 @@ dependencies = [
  "rfc6979",
  "signature",
  "spki",
-]
-
-[[package]]
-name = "echo-system-types"
-version = "0.2.0"
-source = "git+https://github.com/dnacenta/echo-system-types?tag=v0.2.0#acbadc847e4af646025d67b968330c07083a0d96"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2420,6 +2411,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulse-system-types"
+version = "0.5.0"
+source = "git+https://github.com/dnacenta/pulse-null-types?branch=main#d99698ed694270610ccb45ce5b3b17ab59f8bf8a"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
